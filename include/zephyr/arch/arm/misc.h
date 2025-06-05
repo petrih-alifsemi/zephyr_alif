@@ -60,6 +60,11 @@ bool z_arm_on_enter_cpu_idle(void);
 void z_arm_on_enter_cpu_idle_prepare(void);
 #endif
 
+#if defined(CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT) && CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT
+void cpu_idle_enter_clock(void);
+void cpu_idle_exit_clock(void);
+#endif
+
 #endif
 
 #ifdef __cplusplus

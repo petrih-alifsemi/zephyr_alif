@@ -101,6 +101,10 @@ SECTION_FUNC(TEXT, arch_cpu_idle)
 #endif
 
 #if defined(CONFIG_ARMV7_M_ARMV8_M_MAINLINE)
+#if defined(CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT) && CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT
+	bl cpu_idle_enter_clock
+#endif
+
 	/*
 	 * PRIMASK is always cleared on ARMv7-M and ARMv8-M Mainline (not used
 	 * for interrupt locking), and configuring BASEPRI to the lowest
@@ -139,6 +143,12 @@ SECTION_FUNC(TEXT, arch_cpu_idle)
 	cpsie	i
 	isb
 
+#if defined(CONFIG_ARMV7_M_ARMV8_M_MAINLINE)
+#if defined(CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT) && CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT
+	bl cpu_idle_exit_clock
+#endif
+#endif
+
 	bx	lr
 
 SECTION_FUNC(TEXT, arch_cpu_atomic_idle)
@@ -160,6 +170,13 @@ SECTION_FUNC(TEXT, arch_cpu_atomic_idle)
 	pop	{r0, lr}
 #endif /* CONFIG_ARMV6_M_ARMV8_M_BASELINE */
 #endif
+
+#if defined(CONFIG_ARMV7_M_ARMV8_M_MAINLINE)
+#if defined(CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT) && CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT
+	bl cpu_idle_enter_clock
+#endif
+#endif
+
 	/*
 	 * Lock PRIMASK while sleeping: wfe will still get interrupted by
 	 * incoming interrupts but the CPU will not service them right away.
@@ -195,6 +212,11 @@ _irq_disabled:
 
 	msr	BASEPRI, r0
 	cpsie	i
+
+#if defined(CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT) && CONFIG_USE_DYNAMIC_CLOCK_ADJUSTMENT
+	bl cpu_idle_exit_clock
+#endif
+
 #else
 #error Unknown ARM architecture
 #endif /* CONFIG_ARMV6_M_ARMV8_M_BASELINE */
