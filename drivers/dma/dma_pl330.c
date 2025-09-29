@@ -820,7 +820,7 @@ static int dma_pl330_initialize(const struct device *dev)
 	dev_data->axi_data_width = sys_read32(dev_cfg->reg_base + DMAC_PL330_CRD)
 								& DMA_AXI_DATA_WIDTH_MASK;
 
-	LOG_INF("Device %s initialized", dev->name);
+	LOG_DBG("Device %s initialized", dev->name);
 
 	return 0;
 }
