@@ -136,7 +136,7 @@ static int balletto_b1_dk_rtss_he_init(void)
 	}
 #endif /* DT_NODE_HAS_STATUS(DT_NODELABEL(timer1), okay) */
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(snps_dw_timers) */
-	if (balletto_do_dcdc_fix()) {
+	if (IS_ENABLED(CONFIG_SOC_B1_DK_RTSS_HE) && balletto_do_dcdc_fix()) {
 		/* A0-A4 DCDC fix
 		 * This is needed to clean BLE transmissions.
 		 */
