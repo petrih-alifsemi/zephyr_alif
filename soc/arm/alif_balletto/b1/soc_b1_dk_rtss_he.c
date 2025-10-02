@@ -24,6 +24,8 @@ LOG_MODULE_REGISTER(soc, CONFIG_SOC_LOG_LEVEL);
 
 #define HOST_SYSTOP_PWR_REQ_LOGIC_ON_MEM_ON 0x12
 
+static bool balletto_do_dcdc_fix(void);
+
 /**
  * Set the RUN profile parameters for this application.
  */
@@ -78,6 +80,17 @@ static int soc_run_profile(void)
 	}
 
 	sys_write32(host_bsys_pwr_req, HOST_BSYS_PWR_REQ);
+
+	if (IS_ENABLED(CONFIG_SOC_B1_DK_RTSS_HE) && balletto_do_dcdc_fix()) {
+		/* A0-A4 DCDC fix
+		 * This is needed to clean BLE transmissions.
+		 */
+		sys_write32(0x0a004411, 0x1a60a034);
+		sys_write32(0x1e11e701, 0x1a60a030);
+	}
+
+	/* Workaround for BLE retentions. To be removed when fixed */
+	sys_write32(0xFFFFFFFF,0x1A60900C);
 
 	return 0;
 }
@@ -197,13 +210,6 @@ static int balletto_b1_dk_rtss_he_init(void)
 	}
 #endif /* DT_NODE_HAS_STATUS(DT_NODELABEL(timer1), okay) */
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(snps_dw_timers) */
-	if (IS_ENABLED(CONFIG_SOC_B1_DK_RTSS_HE) && balletto_do_dcdc_fix()) {
-		/* A0-A4 DCDC fix
-		 * This is needed to clean BLE transmissions.
-		 */
-		sys_write32(0x0a004411, 0x1a60a034);
-		sys_write32(0x1e11e701, 0x1a60a030);
-	}
 
 	/* RTC Clk Enable */
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(rtc0), okay)
