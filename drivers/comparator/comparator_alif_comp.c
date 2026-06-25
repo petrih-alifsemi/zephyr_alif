@@ -18,6 +18,8 @@
 #include <soc_common.h>
 #include "analog_ctrl.h"
 #include <zephyr/logging/log.h>
+#include <se_service.h>
+
 LOG_MODULE_REGISTER(CMP);
 
 #define DT_DRV_COMPAT alif_cmp
@@ -166,8 +168,6 @@ enum CMP_INSTANCE {
 
 
 /* LP comparator macro */
-#define LPCOMP_CLK_SEL	         (1)
-#define LPCOMP_CLK32K_EN        (14)
 #define COMP_LP0_EN             (24)
 #define COMP_LP0_IN_POS_SEL_POS (25)
 #define COMP_LP0_IN_NEG_SEL_POS (27)
@@ -184,7 +184,7 @@ enum CMP_INSTANCE {
 #define ANA_PERIPH_LDO_CONT  (0xAU << 6)
 #define ANA_PERIPH_BG_CONT   (0xAU << 1)
 
-static void cmp_analog_config(const struct device *dev)
+static int cmp_analog_config(const struct device *dev)
 {
 	const struct cmp_config *config = dev->config;
 #if defined(CONFIG_ANALOG_ALIASING)
@@ -195,18 +195,14 @@ static void cmp_analog_config(const struct device *dev)
 		enable_dac6_ref_voltage_alias_mode(adc_vref_base, dac6_base);
 	}
 #else
-	uint32_t regs;
-	uint32_t cmp_reg2_base;
-
-	regs = DEVICE_MMIO_NAMED_GET(dev, config_reg);
-
-	cmp_reg2_base = (regs + CMP_COMP_REG2);
-
 	if (config->drv_inst != CMP_INSTANCE_LP) {
-		enable_dac6_ref_voltage(cmp_reg2_base);
+		const uint32_t regs = DEVICE_MMIO_NAMED_GET(dev, config_reg);
+
+		enable_dac6_ref_voltage(regs + CMP_COMP_REG2);
 	}
 #endif
-	enable_analog_peripherals(ANA_VBAT_REG2);
+
+	return se_service_power_settings_set(POWER_SETTING_ANA_PERIPH_EN, true);
 }
 
 static inline void cmp_enable_interrupt(uintptr_t cmp, uint8_t interrupts)
@@ -233,13 +229,26 @@ static inline void cmp_set_filter_ctrl(uintptr_t cmp, uint32_t filter)
 	sys_write32(data, cmp + CMP_FILTER_CTRL);
 }
 
-static void lpcmp_set_config(const struct device *dev)
+static int lpcmp_set_config(const struct device *dev, bool const enable)
 {
-	uint32_t data = 0;
-	uintptr_t regs = 0;
-
-	regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
 	const struct cmp_config *config = dev->config;
+
+#if CONFIG_SOC_FAMILY_BALLETTO
+	const lpcmp_configure_t lpcmp_cfg = {
+		.comp_lp0_hyst = config->hysteresis_level,
+		.comp_lp0_in_p_sel = config->positive_inp,
+		.comp_lp0_in_m_sel = config->negative_inp,
+		.comp_lp_en = enable,
+		.lpcomp_clk32k_en = true,
+		/* Uses RC clock (default so keep same functionality) */
+		.lpcomp_clk_sel = 1,
+	};
+
+	return se_service_configure_lpcmp(&lpcmp_cfg);
+
+#else
+	const uintptr_t regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
+	uint32_t data = 0;
 
 	data |= config->positive_inp << COMP_LP0_IN_POS_SEL_POS |
 		config->negative_inp << COMP_LP0_IN_NEG_SEL_POS |
@@ -251,11 +260,14 @@ static void lpcmp_set_config(const struct device *dev)
 #if defined(CONFIG_ANALOG_ALIASING)
 	sys_write32(data, regs);
 #else
-	uint32_t value = 0;
+	uint32_t value = sys_read32(regs);
 
-	value = sys_read32(regs);
 	value |= data;
+
 	sys_write32(value, regs);
+#endif
+
+	return 0;
 #endif
 }
 
@@ -300,11 +312,15 @@ static void cmp_set_config(const struct device *dev)
 	sys_write32(data, (regs + CMP_COMP_REG1));
 }
 
-static inline void enable_cmp(const struct device *dev)
+static inline int enable_cmp(const struct device *dev, bool const enable)
 {
-	uintptr_t regs = 0;
-	uint32_t data;
 	const struct cmp_config *config = dev->config;
+
+	if (config->drv_inst == CMP_INSTANCE_LP)
+		return lpcmp_set_config(dev, enable);
+
+	uintptr_t regs;
+	uint32_t data;
 
 #if defined(CONFIG_ANALOG_ALIASING)
 	regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
@@ -316,41 +332,48 @@ static inline void enable_cmp(const struct device *dev)
 
 	switch (config->drv_inst) {
 	case CMP_INSTANCE_0:
-		/* Enable the CMP0 module */
-		data |= CMP0_ENABLE;
+		if (enable)
+			data |= CMP0_ENABLE;
+		else
+			data &= ~CMP0_ENABLE;
 		break;
 
 	case CMP_INSTANCE_1:
-		/* Enable the CMP1 module */
-		data |= CMP1_ENABLE;
+		if (enable)
+			data |= CMP1_ENABLE;
+		else
+			data &= ~CMP1_ENABLE;
 		break;
 
 	case CMP_INSTANCE_2:
-		/* Enable the CMP2 module */
-		data |= CMP2_ENABLE;
+		if (enable)
+			data |= CMP2_ENABLE;
+		else
+			data &= ~CMP2_ENABLE;
 		break;
 
 	case CMP_INSTANCE_3:
-		/* Enable the CMP3 module */
-		data |= CMP3_ENABLE;
+		if (enable)
+			data |= CMP3_ENABLE;
+		else
+			data &= ~CMP3_ENABLE;
 		break;
-	case CMP_INSTANCE_LP:
-		/* Enable the LPCMP module */
-		data |= LPCMP_ENABLE;
-		break;
+	default:
+		return -EINVAL;
 	}
 
 	sys_write32(data, regs);
+	return 0;
 }
 
 static void cmp_irq_handler(const struct device *dev)
 {
-	uintptr_t regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
 	const struct cmp_config *config = dev->config;
 	struct cmp_data *data = dev->data;
 
 	if (config->drv_inst != CMP_INSTANCE_LP) {
-		uint8_t int_status =
+		const uintptr_t regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
+		const uint8_t int_status =
 			sys_read32(regs + CMP_INTERRUPT_STATUS) & CMP_INT_STATUS_MASK;
 
 		/* clear the interrupt before re-starting */
@@ -384,11 +407,8 @@ static void cmp_setup(const struct device *dev)
 static int alif_comp_set_trigger(const struct device *dev,
 				  enum comparator_trigger trigger)
 {
-	uintptr_t regs;
 	struct cmp_data *data = dev->data;
 	const struct cmp_config *config = dev->config;
-
-	regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
 
 	if (config->drv_inst != CMP_INSTANCE_LP) {
 		switch (trigger) {
@@ -411,14 +431,13 @@ static int alif_comp_set_trigger(const struct device *dev,
 		}
 
 		if (data->callback != NULL) {
+			const uintptr_t regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
+
 			cmp_enable_interrupt(regs, data->interrupt_mask);
 		}
 	}
 
-	enable_cmp(dev);
-
-	return 0;
-
+	return enable_cmp(dev, (trigger != COMPARATOR_TRIGGER_NONE));
 }
 
 static int alif_comp_set_trigger_callback(const struct device *dev,
@@ -448,16 +467,18 @@ static int alif_comp_get_output(const struct device *dev)
 #else
 	const struct cmp_config *config = dev->config;
 
-	return gpio_pin_get_dt(&config->cmp_gpio);
+	if (config->cmp_gpio.port)
+		return gpio_pin_get_dt(&config->cmp_gpio);
+
+	return -EIO;
 #endif
 
 }
 
 static int alif_cmp_trigger_is_pending(const struct device *dev)
 {
-	uintptr_t regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
-
-	uint8_t int_status =
+	const uintptr_t regs = DEVICE_MMIO_NAMED_GET(dev, cmp_reg);
+	const uint8_t int_status =
 			sys_read32(regs + CMP_INTERRUPT_STATUS) & CMP_INT_STATUS_MASK;
 
 	/* Check for the pending interrupts */
@@ -487,12 +508,8 @@ static int cmp_init(const struct device *dev)
 		return ret;
 	}
 
-	if (config->drv_inst == CMP_INSTANCE_LP) {
-
-		/* LPCMP configuration value to the Vbat reg2 */
-		lpcmp_set_config(dev);
-
-	} else {
+	/* LPCMP configuration is handled when enabled */
+	if (config->drv_inst != CMP_INSTANCE_LP) {
 		if (!device_is_ready(config->clk_dev)) {
 			LOG_ERR("clock controller not ready");
 			return -ENODEV;
@@ -536,8 +553,10 @@ static int cmp_init(const struct device *dev)
 		}
 	}
 
-	/* comparator set configuration */
-	cmp_analog_config(dev);
+	/* set analog configuration */
+	ret = cmp_analog_config(dev);
+	if (ret)
+		return ret;
 
 	config->irq_config_func(dev);
 
@@ -593,6 +612,7 @@ static DEVICE_API(comparator, alif_comp_api) = {
 		IRQ_CONNECT(DT_INST_IRQN(inst), DT_INST_IRQ(inst, priority), cmp_irq_handler,      \
 			    DEVICE_DT_INST_GET(inst), 0);                                          \
                                                                                                    \
+		NVIC_ClearPendingIRQ(DT_INST_IRQN(inst));                                          \
 		irq_enable(DT_INST_IRQN(inst));                                                    \
 	}
 
