@@ -2194,10 +2194,25 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
 		return 0;
 	}
 
-	if (!hdr->ident) {
+	if (!hdr->ident && hdr->code != BT_L2CAP_LE_CREDITS) {
 		LOG_ERR("Invalid ident value in L2CAP PDU");
 		return 0;
 	}
+
+	/* Interop tolerance for a buggy peer signalling ident counter.
+	 *
+	 * The Bluetooth spec (Core, Vol 3, Part A, 4) reserves signalling ident
+	 * 0x00 as illegal, so we reject it above -- except for LE Flow Control
+	 * Credit (0x16). That command is a standalone, stateless indication: it is
+	 * matched by Source CID, never by ident, and le_credits() ignores the ident
+	 * entirely (no request/response pairing). Some peers (observed with the
+	 * Linux/BlueZ kernel) increment an 8-bit ident per credit PDU and, after
+	 * ~254 frames, wrap it through 0xFF to 0x00 and keep sending 0x00. Rejecting
+	 * those drops the granted credits, so our TX credits silently starve and the
+	 * transfer wedges at ~254 SDUs. Accepting ident 0 only for this stateless
+	 * credit indication keeps us strict for every command that actually needs a
+	 * valid ident while remaining interoperable.
+	 */
 
 	switch (hdr->code) {
 	case BT_L2CAP_CONN_PARAM_RSP:

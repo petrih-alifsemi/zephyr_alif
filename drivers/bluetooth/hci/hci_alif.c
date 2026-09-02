@@ -490,12 +490,60 @@ static void bt_uart_isr(const struct device *uart, void *user_data)
 {
 	struct device *dev = user_data;
 
+	/* Instrumentation: watch for UART RX overruns. An overrun drops a byte,
+	 * which desyncs the H:4 framing permanently (no resync here) and stalls
+	 * the HCI ACL flow -- the "controller wedge". If a wedge coincides with a
+	 * jump in this counter, the transport overrun is confirmed as the cause.
+	 */
+	int uerr = uart_err_check(uart);
+
+	if (uerr > 0 && (uerr & (UART_ERROR_OVERRUN | UART_ERROR_FRAMING))) {
+		static uint32_t hci_uart_err_count;
+
+		hci_uart_err_count++;
+		if ((hci_uart_err_count & 0x3f) == 1) {
+			printk("[hci_alif] UART RX error 0x%x (count=%u) -- H:4 "
+			       "may desync\n", uerr, hci_uart_err_count);
+		}
+	}
+
 	while (uart_irq_update(uart) && uart_irq_is_pending(uart)) {
+		bool did_work = false;
+
+		/* Service RX and TX INDEPENDENTLY on every ISR iteration (like the
+		 * upstream Zephyr h4.c driver), instead of the original Alif
+		 * `if (tx) ... else if (rx) ...` which made them mutually exclusive.
+		 *
+		 * With that `else if` and TX checked first, a sustained ACL TX
+		 * stream (TX FIFO almost always has room -> tx_ready almost always
+		 * true) monopolised the ISR and starved RX; at 3 Mbaud the RX FIFO
+		 * then overran, dropped a byte and permanently desynced the H:4
+		 * framing. A single dropped "Number of Completed Packets" event
+		 * wedges the ACL flow: the host stops draining/answering, both peers
+		 * freeze on the same SDU with healthy L2CAP credits, and the
+		 * controller looks "unresponsive" (the desynced host can't parse any
+		 * response). Merely swapping the priority moved the starvation to
+		 * TX. Servicing both every iteration lets neither starve: RX is
+		 * drained promptly (no overrun) and TX still makes progress.
+		 */
+		if (uart_irq_rx_ready(uart)) {
+			process_rx(dev);
+			did_work = true;
+		}
+
 		if (uart_irq_tx_ready(uart)) {
 			process_tx(dev);
-		} else if (uart_irq_rx_ready(uart)) {
-			process_rx(dev);
-		} else {
+			did_work = true;
+		}
+
+		if (!did_work) {
+			/* A pending IRQ that is neither RX nor TX -- e.g. a
+			 * modem-status interrupt from CTS toggling under HW flow
+			 * control, or a line-status error. Break to avoid spinning
+			 * the ISR forever (nothing here clears those causes; the LSR
+			 * error, if any, was already read/cleared by
+			 * uart_err_check() above).
+			 */
 			break;
 		}
 	}
