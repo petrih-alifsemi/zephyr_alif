@@ -189,6 +189,7 @@ unsigned int pix_fmt_bpp(uint32_t fmt)
 	case VIDEO_PIX_FMT_Y6P:
 	case VIDEO_PIX_FMT_Y7P:
 	case VIDEO_PIX_FMT_GREY:
+	case VIDEO_PIX_FMT_JPEG:
 		return 8;
 	case VIDEO_PIX_FMT_Y10P:
 		return 10;
@@ -236,13 +237,15 @@ static inline void hw_cam_soft_reset(uintptr_t regs)
 static inline void hw_cam_start_video_capture(const struct device *dev)
 {
 	const struct video_cam_config *config = dev->config;
+	struct video_cam_data *data = dev->data;
 	uintptr_t regs = DEVICE_MMIO_GET(dev);
 
+	data->vsync_count = 0;
 	/* Apply soft reset before starting capture */
 	hw_cam_soft_reset(regs);
 
-	/* Start video capture. */
-	if (config->capture_mode == CPI_CAPTURE_MODE_SNAPSHOT) {
+	/* Start video capture. Force snapshot mode for JPEG. */
+	if (data->is_jpeg || config->capture_mode == CPI_CAPTURE_MODE_SNAPSHOT) {
 		sys_write32(CAM_CTRL_FIFO_CLK_SEL | CAM_CTRL_SNAPSHOT | CAM_CTRL_START,
 			    regs + CAM_CTRL);
 	} else {
@@ -433,9 +436,9 @@ static int alif_cam_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 		       struct video_format *fmt)
 {
 	const struct video_cam_config *config = dev->config;
-	int bits_pp = pix_fmt_bpp(fmt->pixelformat);
+	const int bits_pp = pix_fmt_bpp(fmt->pixelformat);
 	struct video_cam_data *data = dev->data;
-	uintptr_t regs = DEVICE_MMIO_GET(dev);
+	const uintptr_t regs = DEVICE_MMIO_GET(dev);
 	int ret;
 
 	/*
@@ -451,10 +454,34 @@ static int alif_cam_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 	data->current_format.pitch = fmt->pitch;
 	data->current_format.width = fmt->width;
 	data->current_format.height = fmt->height;
+	data->is_jpeg = (fmt->pixelformat == VIDEO_PIX_FMT_JPEG);
 
-	sys_write32((((fmt->height - 1) & CAM_VIDEO_FCFG_ROW_MASK) << CAM_VIDEO_FCFG_ROW_SHIFT) |
-			    ((fmt->width & CAM_VIDEO_FCFG_DATA_MASK) << CAM_VIDEO_FCFG_DATA_SHIFT),
-		    regs + CAM_VIDEO_FCFG);
+	if (data->is_jpeg) {
+		/*
+		 * For JPEG: configure CPI for worst-case buffer size.
+		 * JPEG compressed size is unknown, so set max frame
+		 * dimensions. App will scan for EOI marker and stop.
+		 * Use pitch as row width (bytes per row in buffer).
+		 */
+		uint32_t max_rows = (fmt->pitch * fmt->height) / fmt->pitch;
+
+		sys_write32((((max_rows - 1) & CAM_VIDEO_FCFG_ROW_MASK)
+			     << CAM_VIDEO_FCFG_ROW_SHIFT) |
+			    ((fmt->pitch & CAM_VIDEO_FCFG_DATA_MASK)
+			     << CAM_VIDEO_FCFG_DATA_SHIFT),
+			    regs + CAM_VIDEO_FCFG);
+
+		/* Set read watermark to 0 for JPEG */
+		reg_write_part(regs + CAM_FIFO_CTRL, 0,
+			       CAM_FIFO_CTRL_RD_WMARK_MASK,
+			       CAM_FIFO_CTRL_RD_WMARK_SHIFT);
+	} else {
+		sys_write32((((fmt->height - 1) & CAM_VIDEO_FCFG_ROW_MASK)
+			     << CAM_VIDEO_FCFG_ROW_SHIFT) |
+			    ((fmt->width & CAM_VIDEO_FCFG_DATA_MASK)
+			     << CAM_VIDEO_FCFG_DATA_SHIFT),
+			    regs + CAM_VIDEO_FCFG);
+	}
 
 	ret = video_set_format(config->endpoint_dev, ep, fmt);
 	if (ret) {
@@ -528,8 +555,24 @@ static int alif_cam_stream_start(const struct device *dev)
 	/* Cancel any stale work_helper from previous session before starting */
 	k_work_cancel_sync(&data->cb_work, &sync);
 
-	/* Apply soft reset to clear BUSY flag and leave CPI in clean state */
-	hw_cam_soft_reset(regs);
+	if (sys_read32(regs + CAM_CTRL) & CAM_CTRL_BUSY) {
+		/*
+		 * BUSY is stuck from a previous capture whose cleanup ran
+		 * through the work-callback early-return path.  Disable
+		 * interrupts first so the SW_RESET does not trigger INTR_STOP
+		 * while they are still live, then force-clear BUSY and any
+		 * accumulated interrupt flags before re-enabling below.
+		 */
+		LOG_WRN("CPI busy at stream_start, forcing SW_RESET to clear");
+		hw_disable_interrupts(regs, INTR_VSYNC | INTR_BRESP_ERR | INTR_OUTFIFO_OVERRUN |
+						   INTR_INFIFO_OVERRUN | INTR_STOP);
+
+		/* Apply soft reset to clear BUSY flag and leave CPI in clean state */
+		hw_cam_soft_reset(regs);
+
+		sys_write32(~0u, regs + CAM_INTR);   /* clear all pending flags */
+		data->vsync_count = 0;
+	}
 
 	if (((IS_ENABLED(CONFIG_VIDEO_ALIF_CAM_EXTENDED)) && config->axi_bus_ep) ||
 	    (!IS_ENABLED(CONFIG_VIDEO_ALIF_CAM_EXTENDED))) {
@@ -545,16 +588,35 @@ static int alif_cam_stream_start(const struct device *dev)
 				regs + CAM_FRAME_ADDR);
 	}
 
-	/* Setup the interrupts. */
-	hw_enable_interrupts(regs, INTR_VSYNC | INTR_BRESP_ERR | INTR_OUTFIFO_OVERRUN |
-					   INTR_INFIFO_OVERRUN | INTR_STOP);
+	data->cold_start = true;
 
-	/* Start the MIPI CSI-2 IP in case the MIPI CSI is available. */
+	/* Start the sensor endpoint (SW_PWUP for OV5640) BEFORE enabling
+	 * interrupts.  The OV5640 emits spurious VSYNCs for a few ms right
+	 * after SW_PWUP while its PLLs lock; arming interrupts only after
+	 * this settle window prevents those garbage pulses from triggering
+	 * the ISR and corrupting driver state.
+	 */
 	ret = video_stream_start(config->endpoint_dev);
 	if (ret) {
 		LOG_ERR("Failed to start streaming of Video pipeline!");
 		return -EIO;
 	}
+
+	if (data->cold_start) {
+		/*
+		 * OV5640 emits spurious VSYNCs for ~1 ms after SW_PWUP while
+		 * its PLLs lock.  5 ms gives 5× margin.  After the settle,
+		 * clear any interrupt flags the hardware latched so the first
+		 * real VSYNC arrives into a clean ISR state.
+		 */
+		k_msleep(5);
+		sys_write32(~0u, regs + CAM_INTR);   /* clear pending flags */
+		data->vsync_count = 0;
+	}
+
+	/* Setup the interrupts. */
+	hw_enable_interrupts(regs, INTR_VSYNC | INTR_BRESP_ERR | INTR_OUTFIFO_OVERRUN |
+					   INTR_INFIFO_OVERRUN | INTR_STOP);
 
 	hw_cam_start_video_capture(dev);
 	LOG_DBG("Stream started");
@@ -573,6 +635,13 @@ static int alif_cam_stream_stop(const struct device *dev)
 	int ret;
 
 	if (!data->is_streaming) {
+		/*
+		 * The work callback may have already cleared is_streaming but
+		 * left interrupts enabled.  Silence them unconditionally so
+		 * stale VSYNCs cannot interfere with the next stream_start.
+		 */
+		hw_disable_interrupts(regs, INTR_VSYNC | INTR_BRESP_ERR | INTR_OUTFIFO_OVERRUN |
+						    INTR_INFIFO_OVERRUN | INTR_STOP);
 		LOG_DBG("Already stopped streaming.");
 		return 0;
 	}
@@ -602,11 +671,19 @@ static int alif_cam_stream_stop(const struct device *dev)
 		k_msleep(1);
 	}
 
-	/* Apply soft reset to clear BUSY flag and leave CPI in clean state */
-	hw_cam_soft_reset(regs);
-
-	/* Clear any stale latched interrupts after reset */
-	sys_write32(sys_read32(regs + CAM_INTR), regs + CAM_INTR);
+	/*
+	 * If BUSY is still set after the poll (e.g. after a sensor startup
+	 * glitch that produced back-to-back garbage VSYNCs leaving the CPI
+	 * in a stuck state), force a SW_RESET to ensure the controller is
+	 * fully idle before the next stream_start.
+	 */
+	if (sys_read32(regs + CAM_CTRL) & CAM_CTRL_BUSY) {
+		LOG_WRN("CPI still busy after stop, forcing SW_RESET");
+		/* Apply soft reset to clear BUSY flag and leave CPI in clean state */
+		hw_cam_soft_reset(regs);
+		/* Clear any stale latched interrupts after reset */
+		sys_write32(sys_read32(regs + CAM_INTR), regs + CAM_INTR);
+	}
 
 	LOG_DBG("Stream stopped");
 
@@ -712,6 +789,28 @@ static int alif_cam_enqueue(const struct device *dev, enum video_endpoint_id ep,
 	}
 
 	to_read = data->current_format.pitch * data->current_format.height;
+
+	if (data->is_jpeg && data->current_format.pitch) {
+		/*
+		 * JPEG size is data-dependent, so a large frame could overrun
+		 * this buffer. The CPI stops after the CAM_VIDEO_FCFG row
+		 * count. Clamp that row count to what fits in buf->size so
+		 * the DMA cannot write past the buffer.
+		 */
+		uintptr_t regs = DEVICE_MMIO_GET(dev);
+		uint32_t pitch = data->current_format.pitch;
+		uint32_t max_rows = MIN(data->current_format.height,
+					buf->size / pitch);
+
+		sys_write32((((max_rows - 1) & CAM_VIDEO_FCFG_ROW_MASK)
+			     << CAM_VIDEO_FCFG_ROW_SHIFT) |
+			    ((pitch & CAM_VIDEO_FCFG_DATA_MASK)
+			     << CAM_VIDEO_FCFG_DATA_SHIFT),
+			    regs + CAM_VIDEO_FCFG);
+
+		to_read = max_rows * pitch;
+	}
+
 	buf->bytesused = to_read;
 
 	k_fifo_put(&data->fifo_in, buf);
@@ -836,7 +935,34 @@ static void alif_video_cam_isr(const struct device *dev)
 	}
 
 	if (int_st & INTR_VSYNC) {
-		LOG_DBG("V-SYNC detected.");
+		data->vsync_count++;
+		LOG_DBG("V-SYNC detected (count=%u).", data->vsync_count);
+
+		/*
+		 * For JPEG snapshot capture INTR_STOP never fires.
+		 * VSYNC1 = capture-start, VSYNC2 = capture-end (end-of-frame).
+		 *
+		 * cold_start means the CPI was armed before the sensor produced
+		 * its first VSYNC after power-up, so VSYNC1 and VSYNC2 are the
+		 * sensor's first frame pair with no missed warm-up frame.
+		 * Once the frame rate PLL is corrected the threshold can be
+		 * lowered to 1 for cold_start captures to save one full frame
+		 * period.  For now both paths use 2.
+		 */
+		uint8_t vsync_needed = 2;
+
+		if (data->is_jpeg && data->vsync_count >= vsync_needed) {
+			data->cold_start = false;
+			sys_write32(0, regs + CAM_CTRL);
+			if (is_not_corrupted_frame) {
+				LOG_DBG("JPEG frame complete (VSYNC).");
+				k_work_submit_to_queue(&data->cb_workq,
+						       &data->cb_work);
+			} else {
+				data->curr_vid_buf = 0;
+				is_not_corrupted_frame = true;
+			}
+		}
 	}
 
 	if (int_st & INTR_BRESP_ERR) {
@@ -864,7 +990,7 @@ static void alif_video_cam_isr(const struct device *dev)
 		}
 		/* No corruption observed during dumping this frame. */
 		if (is_not_corrupted_frame) {
-			LOG_DBG("Video Capture stopped.");
+			LOG_DBG("Video Capture stopped - frame complete.");
 			k_work_submit_to_queue(&data->cb_workq, &data->cb_work);
 		} else {
 			/* Wait for user to handle corrupted frame capture. */
@@ -1177,21 +1303,41 @@ static int alif_cam_suspend(const struct device *dev)
  * @param dev CPI device struct
  * @return 0 if successful, negative errno otherwise
  */
-static int alif_cam_resume(const struct device *dev)
+int alif_cam_restore_pins(const struct device *dev)
 {
 	const struct video_cam_config *config = dev->config;
-	int ret;
 
 #ifdef CONFIG_PINCTRL
-	/* Apply default pin configuration */
 	if (config->pcfg != NULL) {
-		ret = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_DEFAULT);
+		int ret = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_DEFAULT);
+
+		/*
+		 * Resume puts this device's pins back, then later devices
+		 * resume and can mux the same pads (AHI trace uses LPCAM
+		 * D1/D2). Call again after cpu_freq_pstate_set() returns.
+		 */
 		if (ret < 0 && ret != -ENOENT) {
 			LOG_ERR("Failed to apply default pinctrl state: %d", ret);
 			return ret;
 		}
 	}
+#else
+	ARG_UNUSED(config);
 #endif
+	return 0;
+}
+
+static int alif_cam_resume(const struct device *dev)
+{
+	const struct video_cam_config *config = dev->config;
+	struct video_cam_data *data = dev->data;
+	uintptr_t regs = DEVICE_MMIO_GET(dev);
+	int ret;
+
+	ret = alif_cam_restore_pins(dev);
+	if (ret) {
+		return ret;
+	}
 
 	if (config->pixclk && config->interface == CAM_INTERFACE_SERIAL) {
 		ret = clock_control_on(config->clk_dev, config->pixclk);
@@ -1221,6 +1367,16 @@ static int alif_cam_resume(const struct device *dev)
 	if (ret) {
 		LOG_ERR("Failed to re-setup CPI controller on resume: %d", ret);
 		return ret;
+	}
+
+	/*
+	 * setup() reloads the devicetree read watermark (default 8). JPEG
+	 * capture requires 0, programmed in set_fmt().
+	 */
+	if (data->is_jpeg) {
+		reg_write_part(regs + CAM_FIFO_CTRL, 0,
+			       CAM_FIFO_CTRL_RD_WMARK_MASK,
+			       CAM_FIFO_CTRL_RD_WMARK_SHIFT);
 	}
 
 	LOG_DBG("PM: Resumed %s", dev->name);

@@ -17,12 +17,15 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/drivers/video-controls.h>
+#include <zephyr/drivers/video/ov5640-video-controls.h>
 #include <zephyr/dt-bindings/video/video-interfaces.h>
 
 LOG_MODULE_REGISTER(video_ov5640, CONFIG_VIDEO_LOG_LEVEL);
 
 #define CHIP_ID_REG 0x300a
 #define CHIP_ID_VAL 0x5640
+
+#define CHIP_REVISION_REG 0x302a
 
 #define SYS_CTRL0_REG     0x3008
 #define SYS_CTRL0_SW_PWDN 0x42
@@ -92,6 +95,19 @@ LOG_MODULE_REGISTER(video_ov5640, CONFIG_VIDEO_LOG_LEVEL);
 #define SDE_CTRL10_REG 0x558a
 #define SDE_CTRL11_REG 0x558b
 
+#define JPEG_CTRL00_REG      0x4400
+#define JPEG_CTRL01_REG      0x4401
+#define JPEG_CTRL04_REG      0x4404
+#define VFIFO_CTRL00_REG     0x4600
+#define VFIFO_HSIZE_H_REG    0x4602
+#define VFIFO_HSIZE_L_REG    0x4603
+#define VFIFO_VSIZE_H_REG    0x4604
+#define VFIFO_VSIZE_L_REG    0x4605
+#define VFIFO_CTRL0C_REG     0x460c
+#define VFIFO_CTRL0D_REG     0x460d
+#define JPG_MODE_SELECT_REG  0x4713
+#define DVP_HREF_CTRL_REG    0x471f
+
 #define DEFAULT_MIPI_CHANNEL 0
 
 #define PI 3.141592654
@@ -146,6 +162,7 @@ struct ov5640_data {
 	uint64_t cur_pixrate;
 	uint16_t cur_frmrate;
 	const struct ov5640_mode_config *cur_mode;
+	uint8_t chip_revision;
 };
 
 static const struct ov5640_reg init_params_common[] = {
@@ -435,13 +452,13 @@ static const struct ov5640_reg init_params_dvp[] = {
 	{0x460b, 0x35},
 	{0x460c, 0x22},
 	{0x3824, 0x01}, /* DVP PCLK divider = 1 */
-	{0x3406, 0x01},
-	{0x3400, 0x06},
-	{0x3401, 0x80},
-	{0x3402, 0x04},
-	{0x3403, 0x00},
-	{0x3404, 0x06},
-	{0x3405, 0x00},
+	{0x3406, 0x01}, /* AWB manual gain enable (bit0), keep AWB gain 0 = auto, 1 = manual */
+	{0x3400, 0x06}, /* AWB R gain[11:8] */
+	{0x3401, 0x80}, /* AWB R gain[7:0]  */
+	{0x3402, 0x04}, /* AWB G gain[11:8] */
+	{0x3403, 0x00}, /* AWB G gain[7:0]  */
+	{0x3404, 0x06}, /* AWB B gain[11:8] */
+	{0x3405, 0x00}, /* AWB B gain[7:0]  */
 	{0x5688, 0x22},
 	{0x5689, 0x22},
 	{0x568a, 0x42},
@@ -452,11 +469,13 @@ static const struct ov5640_reg init_params_dvp[] = {
 	{0x568f, 0x22},
 	{0x5025, 0x00},
 	{0x3406, 0x00},
-	{0x3503, 0x01}, /* Enable manual setting for AE */
-	{0x3500, 0x00}, /* AEC bit[19:16] */
-	{0x3501, 0x25}, /* AEC bit[15:8] */
-	{0x3502, 0x80}, /* AEC bit[7:0] */
-	{0x3008, 0x02},
+	{0x3503, 0x01}, /* manual AE (bit0), keep AGC auto */
+	/* SW_PWUP (0x3008=0x02) is intentionally omitted here.
+	 * The sensor stays in power-down until stream_start, which calls
+	 * ov5640_set_stream(true) → SW_PWUP after the CPI is already armed.
+	 * This guarantees the CPI is ready before the sensor emits its first
+	 * VSYNC, so capture starts on the very first frame after cold boot.
+	 */
 	{0x3a02, 0x07},
 	{0x3a03, 0xae},
 	{0x3a08, 0x01},
@@ -538,6 +557,29 @@ static const struct ov5640_reg dvp_480x272_res_params[] = {
 	{0x3814, 0x31}, {0x3815, 0x31}, {0x3820, 0x47}, {0x3821, 0x01}, {0x4602, 0x01},
 	{0x4603, 0xe0}, {0x4604, 0x01}, {0x4605, 0x10}};
 
+/* Initialization sequence for QSXGA resolution (2592x1944) */
+static const struct ov5640_reg dvp_2592x1944_res_params[] = {
+	{0x3800, 0x00}, {0x3801, 0x00}, {0x3802, 0x00}, {0x3803, 0x00}, {0x3804, 0x0a},
+	{0x3805, 0x3f}, {0x3806, 0x07}, {0x3807, 0x9f}, {0x3808, 0x0a}, {0x3809, 0x20},
+	{0x380a, 0x07}, {0x380b, 0x98}, {0x380c, 0x0b}, {0x380d, 0x1c}, {0x380e, 0x07},
+	{0x380f, 0xb0}, {0x3810, 0x00}, {0x3811, 0x10}, {0x3812, 0x00}, {0x3813, 0x04},
+	{0x3814, 0x11}, {0x3815, 0x11}, {0x3820, 0x40}, {0x3821, 0x06}, {0x4602, 0x0a},
+	{0x4603, 0x20}, {0x4604, 0x07}, {0x4605, 0x98},
+	/* PLL: sys_div=1 (0x3035[7:4]=1) gives ~80 ms frames (3× faster than sys_div=3).
+	 * root_div=2 kept (0x3037[4]=1) — removing it caused JPEG SOI miss.
+	 * VCO unchanged at 700 MHz (XVCLK=20 MHz, pre_div=3, mult=105, root_div=2).
+	 * 0x3108[5:4]=10 → PCLK = pll_clki/4 ≈ 17.5 MHz (safely under 23.3 MHz baseline).
+	 * This decouples the output pad clock from the sensor's internal pixel clock,
+	 * allowing fast frame readout without overdriving the LP-CPI.
+	 */
+	{0x3035, 0x11}, {0x3036, 0x69}, {0x3037, 0x13},
+	/* 0x3108: bits[5:4]=10 → PCLK=pll_clki/4
+	 *         bits[1:0]=01 → SCLK=pll_clki/2 (unchanged).
+	 */
+	{0x3108, 0x21},
+	/* AEC PK EXPOSURE [19:0] */
+	{0x3500, 0x01}, {0x3501, 0x2c}, {0x3502, 0x00}};
+
 static const struct ov5640_mode_config dvp_modes[] = {
 	{
 		.width = 160,
@@ -562,6 +604,14 @@ static const struct ov5640_mode_config dvp_modes[] = {
 		.res_params = dvp_480x272_res_params,
 		.max_frmrate = OV5640_60_FPS,
 		.def_frmrate = OV5640_30_FPS,
+	},
+	{
+		.width = 2592,
+		.height = 1944,
+		.array_size_res_params = ARRAY_SIZE(dvp_2592x1944_res_params),
+		.res_params = dvp_2592x1944_res_params,
+		.max_frmrate = OV5640_15_FPS,
+		.def_frmrate = OV5640_15_FPS,
 	}};
 
 #define OV5640_VIDEO_FORMAT_CAP(width, height, format)                                             \
@@ -584,6 +634,10 @@ static const struct video_format_cap dvp_fmts[] = {
 	OV5640_VIDEO_FORMAT_CAP(160, 120, VIDEO_PIX_FMT_RGB565),
 	OV5640_VIDEO_FORMAT_CAP(320, 240, VIDEO_PIX_FMT_RGB565),
 	OV5640_VIDEO_FORMAT_CAP(480, 272, VIDEO_PIX_FMT_RGB565),
+	OV5640_VIDEO_FORMAT_CAP(160, 120, VIDEO_PIX_FMT_JPEG),
+	OV5640_VIDEO_FORMAT_CAP(320, 240, VIDEO_PIX_FMT_JPEG),
+	OV5640_VIDEO_FORMAT_CAP(480, 272, VIDEO_PIX_FMT_JPEG),
+	OV5640_VIDEO_FORMAT_CAP(2592, 1944, VIDEO_PIX_FMT_JPEG),
 	{0}};
 
 static inline bool ov5640_is_dvp(const struct device *dev)
@@ -821,6 +875,71 @@ static int ov5640_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 	}
 
 	/* Set pixel format */
+	if (fmt->pixelformat == VIDEO_PIX_FMT_JPEG) {
+		/* Step 1: Enable JPEG clocks first */
+		ret = ov5640_modify_reg(&cfg->i2c, SYS_CLK_ENABLE02_REG, 0x28, 0x28);
+		if (ret) {
+			LOG_ERR("Unable to enable JPEG clocks");
+			return ret;
+		}
+
+		/* Step 2: Release JPEG, JFIFO, SFIFO from reset */
+		ret = ov5640_modify_reg(&cfg->i2c, SYS_RESET02_REG, 0x1C, 0x00);
+		if (ret) {
+			LOG_ERR("Unable to release JPEG reset");
+			return ret;
+		}
+
+		/* Step 3: Enable JPEG in TIMING_TC_REG21 (bit 5) */
+		ret = ov5640_modify_reg(&cfg->i2c, TIMING_TC_REG21_REG, BIT(5), BIT(5));
+		if (ret) {
+			LOG_ERR("Unable to enable JPEG");
+			return ret;
+		}
+
+		/* Step 4: Configure JPEG registers */
+		struct ov5640_reg jpeg_params[] = {
+			{0x4300, 0x30},              /* YUV422 output for JPEG input */
+			{0x501f, 0x00},              /* ISP YUV422 */
+			{JPG_MODE_SELECT_REG, 0x02}, /* JPEG mode 2 */
+			{JPEG_CTRL00_REG, 0x81},     /* YUV422 input */
+			{JPEG_CTRL01_REG, 0x01},     /* SFIFO control */
+			{JPEG_CTRL04_REG, 0x34},     /* Header enable + gated clock enable */
+			/* Qscale 8: ~2× compression vs default 4.
+			 * At sys_div=1 SCLK is 3× faster; the JPEG encoder produces
+			 * more data per frame which can overflow the 420 KB capture
+			 * buffer for complex scenes.  Qscale 8 keeps complex scenes
+			 * well under the buffer limit with acceptable image quality.
+			 */
+			{0x4407, 0x06},              /* Quantization scale factor */
+			{VFIFO_CTRL00_REG, 0x80},    /* VFIFO ctrl */
+			{0x460b, 0x35},              /* DVP ctrl */
+			/* 0x460c/0x460d: JPEG dummy data pad speed = 0.
+			 * Dummy bytes scale with SCLK; leaving speed > 0 at sys_div=1
+			 * adds ~3× more 0xFF bytes before the SOI, pushing the SOI
+			 * marker past buf[0] and bloating the captured stream.
+			 * bit[1]=1 in 0x460c preserves PCLK manual mode.
+			 */
+			{VFIFO_CTRL0C_REG, 0x02},    /* VFIFO CTRL0C: dummy speed=0, PCLK manual */
+			{VFIFO_CTRL0D_REG, 0x00},    /* Dummy data pad speed = 0 */
+			{0x4712, 0x00},              /* PAD RIGHT CTRL - no padding */
+			{VFIFO_HSIZE_H_REG, (uint8_t)(fmt->width >> 8)},
+			{VFIFO_HSIZE_L_REG, (uint8_t)(fmt->width & 0xff)},
+			{VFIFO_VSIZE_H_REG, (uint8_t)(fmt->height >> 8)},
+			{VFIFO_VSIZE_L_REG, (uint8_t)(fmt->height & 0xff)},
+			{DVP_HREF_CTRL_REG, 0x40},   /* HREF min blanking */
+		};
+
+		ret = ov5640_write_multi_regs(&cfg->i2c, jpeg_params,
+					      ARRAY_SIZE(jpeg_params));
+		if (ret) {
+			LOG_ERR("Unable to set JPEG format");
+			return ret;
+		}
+
+		return 0;
+	}
+
 	struct ov5640_reg fmt_params[] = {
 		{0x4300, 0x6f},
 		{0x501f, 0x01},
@@ -835,6 +954,11 @@ static int ov5640_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 	if (ret) {
 		LOG_ERR("Unable to set pixel format");
 		return ret;
+	}
+
+	/* Disable JPEG when switching to non-JPEG format */
+	if (ov5640_is_dvp(dev)) {
+		ov5640_modify_reg(&cfg->i2c, TIMING_TC_REG21_REG, BIT(5), 0);
 	}
 
 	if (ov5640_is_dvp(dev)) {
@@ -1098,6 +1222,10 @@ static inline int ov5640_get_ctrl(const struct device *dev, unsigned int cid, vo
 		*((uint64_t *)value) = drv_data->cur_pixrate;
 
 		return 0;
+	case VIDEO_OV5640_CID_CHIP_REVISION:
+		*((uint8_t *)value) = drv_data->chip_revision;
+
+		return 0;
 	default:
 		return -ENOTSUP;
 	}
@@ -1161,8 +1289,10 @@ static DEVICE_API(video, ov5640_driver_api) = {
 static int ov5640_init(const struct device *dev)
 {
 	const struct ov5640_config *cfg = dev->config;
+	struct ov5640_data *drv_data = dev->data;
 	struct video_format fmt;
 	uint16_t chip_id;
+	uint8_t chip_rev;
 	int ret;
 
 	if (!device_is_ready(cfg->i2c.bus)) {
@@ -1263,6 +1393,30 @@ static int ov5640_init(const struct device *dev)
 		return -ENODEV;
 	}
 
+	/* Read chip revision (reg 0x302A): bit[7:4] process, bit[3:0] revision */
+	ret = ov5640_read_reg(&cfg->i2c, CHIP_REVISION_REG, &chip_rev, sizeof(chip_rev));
+	if (ret) {
+		LOG_ERR("Unable to read chip revision, ret = %d", ret);
+		return -EIO;
+	}
+	drv_data->chip_revision = chip_rev;
+
+	const char *proc;
+
+	switch (chip_rev >> 4) {
+	case 0xA:
+		proc = "FSI";
+		break;
+	case 0xB:
+		proc = "BSI";
+		break;
+	default:
+		proc = "unknown";
+		break;
+	}
+	LOG_DBG("Chip revision reg 0x302A = 0x%02x (process %s, revision %u)",
+		chip_rev, proc, chip_rev & 0x0F);
+
 	/* Set default format */
 	fmt.pixelformat = VIDEO_PIX_FMT_RGB565;
 	if (ov5640_is_dvp(dev)) {
@@ -1275,6 +1429,7 @@ static int ov5640_init(const struct device *dev)
 		fmt.height = 720;
 	}
 	fmt.pitch = fmt.width * 2;
+
 	ret = ov5640_set_fmt(dev, VIDEO_EP_OUT, &fmt);
 	if (ret) {
 		LOG_ERR("Unable to configure default format");
