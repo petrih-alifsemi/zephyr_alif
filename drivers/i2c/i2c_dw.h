@@ -185,6 +185,7 @@ struct i2c_dw_dev_config {
 
 	uint16_t hcnt;
 	uint16_t lcnt;
+	uint8_t fs_spklen;
 
 	volatile uint8_t state; /* last direction of transfer */
 	uint32_t request_bytes;

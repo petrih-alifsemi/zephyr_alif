@@ -636,6 +636,9 @@ static int i2c_dw_setup(const struct device *dev, uint16_t slave_address)
 		ic_con.bits.addr_slave_10bit = 1U;
 	}
 
+	/* Spike length paired with the hcnt/lcnt programmed below. */
+	write_fs_spklen(dw->fs_spklen != 0U ? dw->fs_spklen : rom->fs_spk_len, reg_base);
+
 	/* Setup the clock frequency and speed mode */
 	switch (I2C_SPEED_GET(dw->app_config)) {
 	case I2C_SPEED_STANDARD:
@@ -797,9 +800,37 @@ static int i2c_dw_transfer(const struct device *dev, struct i2c_msg *msgs, uint8
 		if ((dw->xfr_flags & I2C_MSG_RW_MASK) == I2C_MSG_WRITE) {
 			dw->state |= I2C_DW_CMD_SEND;
 			dw->request_bytes = 0U;
+			ret = i2c_dw_data_send(dev);
 		} else {
 			dw->state |= I2C_DW_CMD_RECV;
 			dw->request_bytes = dw->xfr_len;
+			i2c_dw_data_ask(dev);
+			ret = 0;
+		}
+
+		if (ret != 0) {
+			write_intr_mask(DW_DISABLE_ALL_I2C_INT, reg_base);
+			value = read_clr_intr(reg_base);
+			dw->state = I2C_DW_CMD_ERROR;
+			ret = -EIO;
+			break;
+		}
+
+		/*
+		 * Queue the next message before waiting. This controller
+		 * STOPs when the TX FIFO runs empty, and IC_CON.tx_empty_ctl
+		 * does not hold the bus. A no-STOP message (register address)
+		 * followed by the data byte or a repeated-start read must be
+		 * pushed in this same call. Waking the thread in between lets
+		 * the FIFO underrun at 19.2 MHz, and the data byte goes out
+		 * as a new transfer.
+		 */
+		if (((dw->xfr_flags & I2C_MSG_RW_MASK) == I2C_MSG_WRITE) &&
+		    (dw->xfr_len == 0U) && !(dw->xfr_flags & I2C_MSG_STOP) &&
+		    (msg_left > 1U)) {
+			cur_msg++;
+			msg_left--;
+			continue;
 		}
 
 		/* Enable interrupts to trigger ISR */
@@ -853,29 +884,128 @@ static int i2c_dw_get_configuration(const struct device *dev, uint32_t *config)
 	return 0;
 }
 
-static uint32_t i2c_dw_get_clock_frequency(const struct device *dev)
+static uint32_t i2c_dw_cycles_at_least(uint32_t ic_clk_hz, uint32_t time_ns)
+{
+	return (uint32_t)DIV_ROUND_UP((uint64_t)ic_clk_hz * time_ns, 1000000000ULL);
+}
+
+static uint32_t i2c_dw_get_clock_hz(const struct device *dev)
 {
 #if DT_ANY_INST_HAS_PROP_STATUS_OKAY(clocks)
 	const struct i2c_dw_rom_config *const rom = dev->config;
-	uint32_t clock_freq = 0;
-	int ret = 0;
+	uint32_t clock_hz = 0;
+	int ret;
 
 	if (rom->clk_dev && rom->clk_id) {
-		ret = clock_control_get_rate(rom->clk_dev, rom->clk_id, &clock_freq);
+		ret = clock_control_get_rate(rom->clk_dev, rom->clk_id, &clock_hz);
 		if (ret != 0) {
 			LOG_ERR("Failed to get clock frequency: %d", ret);
-			return -EINVAL;
+			return 0U;
 		}
-		return (clock_freq / 1000000);
+
+		return clock_hz;
+	}
+#endif
+	return (uint32_t)CONFIG_I2C_DW_CLOCK_SPEED * 1000000U;
+}
+
+/*
+ * HCNT/LCNT for a bitrate at ic_clk_hz.
+ * Optimization on (Alif):  tHIGH = HCNT + spike_len + 3, tLOW = LCNT + 1.
+ * Optimization off:        tHIGH = HCNT + spike_len + 7, tLOW = LCNT + 1.
+ * The spike filter must be shorter than both count registers. On a 4.8 MHz
+ * PCLK the devicetree spike of 5 is 1.04 µs, longer than HCNT, and the bit
+ * no longer follows that equation. Shrink the spike until the bit fits.
+ * ic_clk_hz is the bus clock from clock_control_get_rate().
+ */
+static int i2c_dw_calc_scl_cnt(uint32_t ic_clk_hz, uint32_t bitrate, uint32_t min_high_ns,
+			       uint32_t min_low_ns, uint8_t spk_len, int16_t h_off, int16_t l_off,
+			       uint32_t *hcnt, uint32_t *lcnt, uint8_t *spk_out)
+{
+	const uint32_t low_add = 1U;
+	uint32_t period_cycles;
+	uint32_t high_cycles;
+	uint32_t low_cycles;
+	uint32_t spec_high;
+	uint32_t spec_low;
+	uint32_t high_add;
+	uint32_t min_hcnt;
+	uint32_t min_lcnt;
+	uint32_t wire_high;
+	uint32_t wire_low;
+	uint8_t spk;
+	int32_t h;
+	int32_t l;
+
+	if ((ic_clk_hz == 0U) || (bitrate == 0U) || (spk_out == NULL)) {
+		return -EINVAL;
 	}
 
-	/* Use default clock speed if no clock control available */
-	return CONFIG_I2C_DW_CLOCK_SPEED;
+	period_cycles = (ic_clk_hz + (bitrate / 2U)) / bitrate;
+	if (period_cycles == 0U) {
+		return -EINVAL;
+	}
+
+	spec_high = i2c_dw_cycles_at_least(ic_clk_hz, min_high_ns);
+	spec_low = i2c_dw_cycles_at_least(ic_clk_hz, min_low_ns);
+	spk = (spk_len == 0U) ? 1U : spk_len;
+
+	for (;;) {
+#ifdef CONFIG_I2C_DW_IC_CLK_FREQ_OPTIMIZATION
+		high_add = (uint32_t)spk + 3U;
+		min_hcnt = (uint32_t)spk + 1U;
+		if ((min_hcnt + high_add) < 5U) {
+			min_hcnt = 5U - high_add;
+		}
+		min_lcnt = MAX(6U, (uint32_t)spk + 1U);
 #else
-	/* Use default clock speed if no clock control available */
-	/* CONFIG_I2C_DW_CLOCK_SPEED is already in MHz */
-	return CONFIG_I2C_DW_CLOCK_SPEED;
+		high_add = (uint32_t)spk + 7U;
+		min_hcnt = (uint32_t)spk + 6U;
+		min_lcnt = (uint32_t)spk + 8U;
 #endif
+		wire_high = min_hcnt + high_add;
+		wire_low = min_lcnt + low_add;
+		if (wire_high < spec_high) {
+			wire_high = spec_high;
+		}
+		if (wire_low < spec_low) {
+			wire_low = spec_low;
+		}
+		if (((wire_high + wire_low) <= period_cycles) || (spk == 1U)) {
+			break;
+		}
+		spk--;
+	}
+
+	if ((wire_high + wire_low) > period_cycles) {
+		period_cycles = wire_high + wire_low;
+	}
+
+	/* 40% high / 60% low. Both are times on the wire. */
+	high_cycles = (period_cycles * 2U) / 5U;
+	low_cycles = period_cycles - high_cycles;
+	if (high_cycles < wire_high) {
+		high_cycles = wire_high;
+		low_cycles = period_cycles - high_cycles;
+	}
+	if (low_cycles < wire_low) {
+		low_cycles = wire_low;
+		high_cycles = period_cycles - low_cycles;
+	}
+
+	h = (int32_t)(high_cycles - high_add) + h_off;
+	l = (int32_t)(low_cycles - low_add) + l_off;
+	if (h < (int32_t)min_hcnt) {
+		h = (int32_t)min_hcnt;
+	}
+	if (l < (int32_t)min_lcnt) {
+		l = (int32_t)min_lcnt;
+	}
+
+	*hcnt = (uint32_t)h;
+	*lcnt = (uint32_t)l;
+	*spk_out = spk;
+	return 0;
 }
 
 static int i2c_dw_runtime_configure(const struct device *dev, uint32_t config)
@@ -887,32 +1017,40 @@ static int i2c_dw_runtime_configure(const struct device *dev, uint32_t config)
 	uint32_t hcnt_val = 0U;
 	uint32_t rc = 0U;
 	uint32_t reg_base = get_regs(dev);
-	uint32_t clock_freq;
+	uint32_t ic_clk_hz;
+	uint8_t spk = rom->fs_spk_len;
 
 	dw->app_config = config;
 
-	/* Get the actual clock frequency from clock control */
-	clock_freq = i2c_dw_get_clock_frequency(dev);
+	/* ic_clk is the bus clock (SYST_PCLK on Alif). */
+	ic_clk_hz = i2c_dw_get_clock_hz(dev);
+
+	LOG_DBG("I2C PCLK: %u Hz", ic_clk_hz);
 
 	/* Make sure we have a supported speed for the DesignWare model */
 	/* and have setup the clock frequency and speed mode */
 	switch (I2C_SPEED_GET(dw->app_config)) {
 	case I2C_SPEED_STANDARD:
-		lcnt_val = I2C_STD_LCNT(clock_freq) + rom->lcnt_offset;
-		hcnt_val = I2C_STD_HCNT(clock_freq) + rom->hcnt_offset;
+		rc = i2c_dw_calc_scl_cnt(ic_clk_hz, 100000U, 4000U, 4700U, rom->fs_spk_len,
+					 rom->hcnt_offset, rom->lcnt_offset, &hcnt_val, &lcnt_val,
+					 &spk);
 		break;
 	case I2C_SPEED_FAST:
-		lcnt_val = I2C_FS_LCNT(clock_freq) + rom->lcnt_offset;
-		hcnt_val = I2C_FS_HCNT(clock_freq) + rom->hcnt_offset;
+		rc = i2c_dw_calc_scl_cnt(ic_clk_hz, 400000U, 600U, 1300U, rom->fs_spk_len,
+					 rom->hcnt_offset, rom->lcnt_offset, &hcnt_val, &lcnt_val,
+					 &spk);
 		break;
 	case I2C_SPEED_FAST_PLUS:
-		lcnt_val = I2C_FSP_LCNT(clock_freq) + rom->lcnt_offset;
-		hcnt_val = I2C_FSP_HCNT(clock_freq) + rom->hcnt_offset;
+		rc = i2c_dw_calc_scl_cnt(ic_clk_hz, 1000000U, 260U, 500U, rom->fs_spk_len,
+					 rom->hcnt_offset, rom->lcnt_offset, &hcnt_val, &lcnt_val,
+					 &spk);
 		break;
 	case I2C_SPEED_HIGH:
 		if (dw->support_hs_mode) {
-			lcnt_val = I2C_HS_LCNT(clock_freq) + rom->lcnt_offset;
-			hcnt_val = I2C_HS_HCNT(clock_freq) + rom->hcnt_offset;
+			uint32_t clock_mhz = ic_clk_hz / 1000000U;
+
+			lcnt_val = I2C_HS_LCNT(clock_mhz) + rom->lcnt_offset;
+			hcnt_val = I2C_HS_HCNT(clock_mhz) + rom->hcnt_offset;
 		} else {
 			rc = -EINVAL;
 		}
@@ -939,12 +1077,19 @@ static int i2c_dw_runtime_configure(const struct device *dev, uint32_t config)
 #ifdef CONFIG_I2C_DW_IC_CLK_FREQ_OPTIMIZATION
 		lcnt_val = I2C_ENSURE_MIN_SCL_LCNT(lcnt_val);
 #else
-		lcnt_val = I2C_ENSURE_MIN_SCL_LCNT(lcnt_val, rom->fs_spk_len);
+		lcnt_val = I2C_ENSURE_MIN_SCL_LCNT(lcnt_val, spk);
 #endif
-		hcnt_val = I2C_ENSURE_MIN_SCL_HCNT(hcnt_val, rom->fs_spk_len);
+		hcnt_val = I2C_ENSURE_MIN_SCL_HCNT(hcnt_val, spk);
 	}
 	dw->lcnt = lcnt_val;
 	dw->hcnt = hcnt_val;
+	dw->fs_spklen = spk;
+	/*
+	 * IC_FS_SPKLEN is only writable while the controller is disabled.
+	 * setup() writes it again with the hcnt/lcnt pair.
+	 */
+	clear_bit_enable_en(reg_base);
+	write_fs_spklen(spk, reg_base);
 
 	/*
 	 * Clear any interrupts currently waiting in the controller
@@ -1356,6 +1501,7 @@ static int i2c_dw_suspend(const struct device *dev)
 static int i2c_dw_resume(const struct device *dev)
 {
 	const struct i2c_dw_rom_config *const dev_cfg = dev->config;
+	struct i2c_dw_dev_config *const dw = dev->data;
 	uint32_t reg_base = get_regs(dev);
 	int ret;
 
@@ -1382,6 +1528,35 @@ static int i2c_dw_resume(const struct device *dev)
 #endif
 
 	i2c_dw_restore_ctx(dev);
+
+	/*
+	 * The restored high/low counts and spike length belong to the PCLK
+	 * from suspend. Recompute them for the clock that is running now.
+	 */
+	ret = i2c_dw_runtime_configure(dev, dw->app_config);
+	if (ret != 0) {
+		return ret;
+	}
+
+	switch (I2C_SPEED_GET(dw->app_config)) {
+	case I2C_SPEED_STANDARD:
+		write_ss_scl_lcnt(dw->lcnt, reg_base);
+		write_ss_scl_hcnt(dw->hcnt, reg_base);
+		break;
+	case I2C_SPEED_FAST:
+		__fallthrough;
+	case I2C_SPEED_FAST_PLUS:
+		write_fs_scl_lcnt(dw->lcnt, reg_base);
+		write_fs_scl_hcnt(dw->hcnt, reg_base);
+		break;
+	case I2C_SPEED_HIGH:
+		write_hs_scl_lcnt(dw->lcnt, reg_base);
+		write_hs_scl_hcnt(dw->hcnt, reg_base);
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	write_rx_tl(dev_cfg->rx_tl, reg_base);
 	write_tx_tl(dev_cfg->tx_tl, reg_base);
 	set_bit_enable_en(reg_base);
